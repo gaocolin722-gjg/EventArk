@@ -1,9 +1,13 @@
 import { NextResponse } from 'next/server'
 import { getSupabaseAdmin } from '@/lib/supabase-admin'
-import { verifyAntomWebhook } from '@/lib/antom'
+import {
+  isAntomPaymentSuccess,
+  parseAntomOutTradeNo,
+  parseAntomResultStatus,
+  verifyAntomSignature,
+} from '@/lib/pay/antom'
 
 /**
- * Extend Pro subscription by 30 days from now or current expiry (whichever is later).
  * @param {string | null | undefined} currentExpiresAt
  */
 function computeNewExpiry(currentExpiresAt) {
@@ -16,68 +20,36 @@ function computeNewExpiry(currentExpiresAt) {
   return base.toISOString()
 }
 
-export async function POST(request) {
-  const rawBody = await request.text()
-
+async function handleAntomNotify(request) {
   try {
-    const clientId = request.headers.get('client-id') || ''
-    const requestTime = request.headers.get('request-time') || ''
-    const signature = request.headers.get('signature') || ''
-    const publicKey = process.env.ANTOM_PUBLIC_KEY
+    const body = /** @type {Record<string, unknown>} */ (await request.json())
 
-    if (!publicKey) {
-      console.error('ANTOM_PUBLIC_KEY not configured')
-      return NextResponse.json(
-        { result: { resultCode: 'FAIL', resultMessage: 'Server misconfigured' } },
-        { status: 500 }
-      )
+    const signature =
+      request.headers.get('x-antom-signature') ??
+      request.headers.get('x-signature') ??
+      /** @type {string | undefined} */ (body.sign) ??
+      ''
+
+    if (signature) {
+      const { verified, reason } = verifyAntomSignature(body, signature)
+      if (!verified) {
+        console.error('[Antom Webhook] Invalid signature:', reason)
+        return NextResponse.json({ error: 'Invalid signature', reason }, { status: 401 })
+      }
     }
 
-    const path = '/api/antom-notify'
-    const isValid = verifyAntomWebhook(
-      'POST',
-      path,
-      clientId,
-      requestTime,
-      rawBody,
-      signature,
-      publicKey
-    )
+    const resultStatus = parseAntomResultStatus(body)
+    const merchantOrderNo = parseAntomOutTradeNo(body)
 
-    if (!isValid) {
-      console.error('Antom webhook signature verification failed')
+    if (!isAntomPaymentSuccess(resultStatus)) {
       return NextResponse.json(
-        { result: { resultCode: 'FAIL', resultMessage: 'Invalid signature' } },
-        { status: 401 }
+        { received: true, message: 'Payment not successful, no update' },
+        { status: 200 }
       )
     }
-
-    const payload = JSON.parse(rawBody)
-    const notifyType = payload.notifyType || payload.result?.notifyType
-    const paymentStatus =
-      payload.paymentStatus ||
-      payload.result?.paymentStatus ||
-      payload.result?.resultStatus
-
-    const merchantOrderNo =
-      payload.paymentRequestId ||
-      payload.paymentRequestId ||
-      payload.order?.referenceOrderId
 
     if (!merchantOrderNo) {
-      return NextResponse.json({
-        result: { resultCode: 'SUCCESS', resultMessage: 'ignored' },
-      })
-    }
-
-    const isSuccess =
-      notifyType === 'PAYMENT_RESULT' &&
-      (paymentStatus === 'SUCCESS' || paymentStatus === 'S')
-
-    if (!isSuccess) {
-      return NextResponse.json({
-        result: { resultCode: 'SUCCESS', resultMessage: 'acknowledged' },
-      })
+      return NextResponse.json({ error: 'Missing merchant order no' }, { status: 400 })
     }
 
     const admin = getSupabaseAdmin()
@@ -89,16 +61,12 @@ export async function POST(request) {
       .maybeSingle()
 
     if (orderFetchError || !order) {
-      console.error('Order not found:', merchantOrderNo, orderFetchError)
-      return NextResponse.json({
-        result: { resultCode: 'SUCCESS', resultMessage: 'order not found' },
-      })
+      console.error('[Antom Webhook] Order not found:', merchantOrderNo, orderFetchError)
+      return NextResponse.json({ received: true, message: 'order not found' }, { status: 200 })
     }
 
     if (order.status === 'success') {
-      return NextResponse.json({
-        result: { resultCode: 'SUCCESS', resultMessage: 'already processed' },
-      })
+      return NextResponse.json({ success: true, message: 'already processed' })
     }
 
     const { error: updateOrderError } = await admin
@@ -106,16 +74,16 @@ export async function POST(request) {
       .update({
         status: 'success',
         paid_at: new Date().toISOString(),
-        antom_payment_id: payload.paymentId || payload.paymentRequestId || null,
+        antom_payment_id:
+          /** @type {string | undefined} */ (body.paymentId) ??
+          /** @type {string | undefined} */ (body.paymentRequestId) ??
+          null,
       })
       .eq('id', order.id)
 
     if (updateOrderError) {
-      console.error('Failed to update tenant_orders:', updateOrderError)
-      return NextResponse.json(
-        { result: { resultCode: 'FAIL', resultMessage: 'DB update failed' } },
-        { status: 500 }
-      )
+      console.error('[Antom Webhook] Failed to update tenant_orders:', updateOrderError)
+      return NextResponse.json({ error: 'DB update failed' }, { status: 500 })
     }
 
     const { data: existingSub } = await admin
@@ -137,26 +105,25 @@ export async function POST(request) {
     )
 
     if (subError) {
-      console.error('Failed to update user_subscriptions:', subError)
-      return NextResponse.json(
-        { result: { resultCode: 'FAIL', resultMessage: 'Subscription update failed' } },
-        { status: 500 }
-      )
+      console.error('[Antom Webhook] Failed to update user_subscriptions:', subError)
+      return NextResponse.json({ error: 'Subscription update failed' }, { status: 500 })
     }
 
     return NextResponse.json({
-      result: { resultCode: 'SUCCESS', resultMessage: 'success' },
+      success: true,
+      message: 'Membership activated',
+      out_trade_no: merchantOrderNo,
     })
   } catch (err) {
-    console.error('Antom notify error:', err)
-    return NextResponse.json(
-      { result: { resultCode: 'FAIL', resultMessage: 'Internal error' } },
-      { status: 500 }
-    )
+    console.error('[Antom Webhook] Error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 
-// Antom may send GET for health checks
+export async function POST(request) {
+  return handleAntomNotify(request)
+}
+
 export async function GET() {
-  return NextResponse.json({ status: 'ok' })
+  return NextResponse.json({ status: 'ok', gateway: 'ANTOM' })
 }

@@ -128,8 +128,9 @@ function AdminLobbyContent() {
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || tl('upgradeFailed'))
-      if (data.redirectUrl) {
-        window.location.href = data.redirectUrl
+      const paymentUrl = data.paymentUrl || data.redirectUrl
+      if (paymentUrl) {
+        window.location.href = paymentUrl
       }
     } catch (err) {
       setToast({
